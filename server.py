@@ -163,6 +163,7 @@ def main(
     detector_model_path: str = "./pretrained_models/detector.pt",
     conf_threshold: float = 0.3,
     identity: str = "wilor-0",
+    bbox_timeout_ms: float = 200.0,
 ):
     """
     Main WiLoR detection server with external worker protocol.
@@ -295,8 +296,9 @@ def main(
     frame_count = 0
     detection_times = deque(maxlen=100)
     last_valid_bbox_info = None
+    last_valid_time = None  # Timestamp of last valid bbox detection
 
-    _logger.info("Starting detection loop...")
+    _logger.info(f"Starting detection loop... (bbox_timeout: {bbox_timeout_ms}ms)")
 
     while True:
         try:
@@ -329,12 +331,22 @@ def main(
             has_usable_bbox = (valid_lh >= 2) or (valid_rh >= 2)
 
             # Determine what to publish
+            current_time = time.time()
             if has_usable_bbox:
                 bbox_to_publish = bbox_info
                 last_valid_bbox_info = bbox_info
-            elif last_valid_bbox_info is not None:
-                # Reuse last valid bbox to maintain continuity
-                bbox_to_publish = last_valid_bbox_info
+                last_valid_time = current_time
+            elif last_valid_bbox_info is not None and last_valid_time is not None:
+                # Check if last valid bbox has expired
+                elapsed_ms = (current_time - last_valid_time) * 1000
+                if elapsed_ms <= bbox_timeout_ms:
+                    # Reuse last valid bbox to maintain continuity
+                    bbox_to_publish = last_valid_bbox_info
+                else:
+                    # Timeout expired, clear cached bbox
+                    bbox_to_publish = empty_bbox_info
+                    last_valid_bbox_info = None
+                    last_valid_time = None
             else:
                 bbox_to_publish = empty_bbox_info
 
@@ -388,6 +400,10 @@ if __name__ == "__main__":
                         type=float,
                         default=0.3,
                         help="Detection confidence threshold (default: 0.3)")
+    parser.add_argument("--bbox_timeout_ms",
+                        type=float,
+                        default=200.0,
+                        help="Timeout in ms to clear cached bbox when hand leaves frame (default: 200)")
     parser.add_argument("--identity", type=str, default="wilor-0", help="ZMQ identity for DEALER socket")
 
     args = parser.parse_args()
@@ -405,4 +421,5 @@ if __name__ == "__main__":
         detector_model_path=args.detector_model_path,
         conf_threshold=args.conf_threshold,
         identity=args.identity,
+        bbox_timeout_ms=args.bbox_timeout_ms,
     )
