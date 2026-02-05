@@ -49,6 +49,19 @@ def calculate_area(bbox):
     return (x2 - x1) * (y2 - y1)
 
 
+def calculate_center(bbox):
+    """Calculate bounding box center point."""
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+def calculate_center_distance(bbox1, bbox2):
+    """Calculate Euclidean distance between two bbox centers."""
+    c1 = calculate_center(bbox1)
+    c2 = calculate_center(bbox2)
+    return np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+
+
 def get_max_area_hands(bboxes, hand_types, scores):
     """
     Get the largest left hand and right hand by area.
@@ -70,6 +83,92 @@ def get_max_area_hands(bboxes, hand_types, scores):
                 max_right = (bbox, hand_type, score, area)
 
     return max_left, max_right
+
+
+def select_best_hands(
+    bboxes,
+    hand_types,
+    scores,
+    prev_left_bbox=None,
+    prev_right_bbox=None,
+    distance_weight: float = 0.6,
+    max_track_distance: float = 200.0,
+):
+    """
+    Select best left and right hand considering both area and distance to previous detection.
+    
+    Uses a weighted scoring: score = (1 - distance_weight) * norm_area + distance_weight * (1 - norm_distance)
+    Falls back to area-only selection when no previous bbox or distance exceeds threshold.
+    
+    Args:
+        bboxes: List of [x1, y1, x2, y2] bounding boxes
+        hand_types: List of hand types (0=left, 1=right)
+        scores: List of detection confidence scores
+        prev_left_bbox: Previous frame's left hand bbox (or None)
+        prev_right_bbox: Previous frame's right hand bbox (or None)
+        distance_weight: Weight for distance term (0-1, higher = prefer closer to previous)
+        max_track_distance: Max pixel distance for tracking; beyond this, use area-only
+    
+    Returns:
+        (best_left, best_right): Each is None or (bbox, hand_type, score, area)
+    """
+    # Separate detections by hand type
+    left_candidates = []
+    right_candidates = []
+
+    for bbox, hand_type, score in zip(bboxes, hand_types, scores):
+        area = calculate_area(bbox)
+        if hand_type == 0:  # left_hand
+            left_candidates.append((bbox, hand_type, score, area))
+        else:  # right_hand
+            right_candidates.append((bbox, hand_type, score, area))
+
+    def select_best(candidates, prev_bbox):
+        """Select best candidate using combined area + distance scoring."""
+        if not candidates:
+            return None
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # If no previous bbox, fall back to max area
+        if prev_bbox is None:
+            return max(candidates, key=lambda x: x[3])  # x[3] = area
+
+        # Calculate areas and distances for normalization
+        areas = [c[3] for c in candidates]
+        distances = [calculate_center_distance(c[0], prev_bbox) for c in candidates]
+
+        max_area = max(areas) if max(areas) > 0 else 1.0
+        min_area = min(areas)
+
+        best_candidate = None
+        best_score = -float('inf')
+
+        for candidate, area, dist in zip(candidates, areas, distances):
+            # If distance exceeds threshold, this candidate gets area-only scoring
+            if dist > max_track_distance:
+                # Normalize area to [0, 1]
+                norm_area = (area - min_area) / (max_area - min_area) if max_area > min_area else 1.0
+                combined_score = norm_area
+            else:
+                # Normalize area to [0, 1]
+                norm_area = (area - min_area) / (max_area - min_area) if max_area > min_area else 1.0
+                # Normalize distance to [0, 1] where 0 = at prev position, 1 = at max_track_distance
+                norm_distance = dist / max_track_distance
+                # Combined score: higher is better
+                combined_score = (1 - distance_weight) * norm_area + distance_weight * (1 - norm_distance)
+
+            if combined_score > best_score:
+                best_score = combined_score
+                best_candidate = candidate
+
+        return best_candidate
+
+    best_left = select_best(left_candidates, prev_left_bbox)
+    best_right = select_best(right_candidates, prev_right_bbox)
+
+    return best_left, best_right
 
 
 def decode_sync_message(msg: bytes, video_shape: Tuple[int, int]):
@@ -106,9 +205,24 @@ def decode_sync_message(msg: bytes, video_shape: Tuple[int, int]):
         return None, None
 
 
-def detect_hands_batch(detector, rgb_images: List[np.ndarray], conf_threshold: float = 0.3):
+def detect_hands_batch(
+    detector,
+    rgb_images: List[np.ndarray],
+    conf_threshold: float = 0.3,
+    prev_bbox_info: Optional[Dict[str, List]] = None,
+    distance_weight: float = 0.6,
+    max_track_distance: float = 200.0,
+):
     """
-    Run hand detection on a batch of images.
+    Run hand detection on a batch of images with optional tracking.
+    
+    Args:
+        detector: YOLO detector instance
+        rgb_images: List of RGB images (one per camera)
+        conf_threshold: Detection confidence threshold
+        prev_bbox_info: Previous frame's bbox_info for tracking (optional)
+        distance_weight: Weight for distance in tracking score (0-1)
+        max_track_distance: Max pixel distance for tracking association
     
     Returns:
         bbox_info: Dict with 'lh' and 'rh' keys, each containing list of bboxes (one per camera)
@@ -123,7 +237,7 @@ def detect_hands_batch(detector, rgb_images: List[np.ndarray], conf_threshold: f
     }
 
     # Process results for each camera
-    for results in batch_results:
+    for cam_idx, results in enumerate(batch_results):
         bboxes = []
         hand_types = []
         scores = []
@@ -138,17 +252,32 @@ def detect_hands_batch(detector, rgb_images: List[np.ndarray], conf_threshold: f
                 hand_types.append(cls)  # 0: left_hand, 1: right_hand
                 scores.append(conf)
 
-        # Get max area hands for this camera
-        max_left, max_right = get_max_area_hands(bboxes, hand_types, scores)
+        # Get previous bboxes for this camera (if available)
+        prev_left_bbox = None
+        prev_right_bbox = None
+        if prev_bbox_info is not None:
+            prev_left_bbox = prev_bbox_info["lh"][cam_idx]
+            prev_right_bbox = prev_bbox_info["rh"][cam_idx]
+
+        # Select best hands using tracking-aware selection
+        best_left, best_right = select_best_hands(
+            bboxes,
+            hand_types,
+            scores,
+            prev_left_bbox=prev_left_bbox,
+            prev_right_bbox=prev_right_bbox,
+            distance_weight=distance_weight,
+            max_track_distance=max_track_distance,
+        )
 
         # Append bbox to respective lists
-        if max_left is not None:
-            bbox_info["lh"].append(max_left[0])  # Just the bbox coordinates
+        if best_left is not None:
+            bbox_info["lh"].append(best_left[0])  # Just the bbox coordinates
         else:
             bbox_info["lh"].append(None)
 
-        if max_right is not None:
-            bbox_info["rh"].append(max_right[0])
+        if best_right is not None:
+            bbox_info["rh"].append(best_right[0])
         else:
             bbox_info["rh"].append(None)
 
@@ -164,6 +293,8 @@ def main(
     conf_threshold: float = 0.3,
     identity: str = "wilor-0",
     bbox_timeout_ms: float = 200.0,
+    distance_weight: float = 0.6,
+    max_track_distance: float = 200.0,
 ):
     """
     Main WiLoR detection server with external worker protocol.
@@ -176,6 +307,9 @@ def main(
         detector_model_path: Path to YOLO detector model
         conf_threshold: Detection confidence threshold
         identity: ZMQ identity for DEALER socket
+        bbox_timeout_ms: Timeout in ms to clear cached bbox
+        distance_weight: Weight for distance in tracking (0=area only, 1=distance only)
+        max_track_distance: Max pixel distance for tracking association
     """
     _logger.info("WiLoR Hand Detection Server starting...")
 
@@ -297,8 +431,10 @@ def main(
     detection_times = deque(maxlen=100)
     last_valid_bbox_info = None
     last_valid_time = None  # Timestamp of last valid bbox detection
+    prev_bbox_info = None  # Previous frame's bbox for tracking
 
-    _logger.info(f"Starting detection loop... (bbox_timeout: {bbox_timeout_ms}ms)")
+    _logger.info(f"Starting detection loop... (bbox_timeout: {bbox_timeout_ms}ms, "
+                 f"distance_weight: {distance_weight}, max_track_distance: {max_track_distance}px)")
 
     while True:
         try:
@@ -319,11 +455,21 @@ def main(
 
             frame_count += 1
 
-            # Run detection
+            # Run detection with tracking
             det_start = time.time()
-            bbox_info = detect_hands_batch(detector, rgb_images, conf_threshold)
+            bbox_info = detect_hands_batch(
+                detector,
+                rgb_images,
+                conf_threshold,
+                prev_bbox_info=prev_bbox_info,
+                distance_weight=distance_weight,
+                max_track_distance=max_track_distance,
+            )
             det_time = (time.time() - det_start) * 1000  # ms
             detection_times.append(det_time)
+
+            # Update tracking state for next frame
+            prev_bbox_info = bbox_info
 
             # Check detection validity
             valid_lh = sum(b is not None for b in bbox_info["lh"])
@@ -405,6 +551,14 @@ if __name__ == "__main__":
                         default=200.0,
                         help="Timeout in ms to clear cached bbox when hand leaves frame (default: 200)")
     parser.add_argument("--identity", type=str, default="wilor-0", help="ZMQ identity for DEALER socket")
+    parser.add_argument("--distance_weight",
+                        type=float,
+                        default=0.6,
+                        help="Weight for distance in tracking score (0=area only, 1=distance only, default: 0.6)")
+    parser.add_argument("--max_track_distance",
+                        type=float,
+                        default=200.0,
+                        help="Max pixel distance for tracking association (default: 200)")
 
     args = parser.parse_args()
 
@@ -422,4 +576,6 @@ if __name__ == "__main__":
         conf_threshold=args.conf_threshold,
         identity=args.identity,
         bbox_timeout_ms=args.bbox_timeout_ms,
+        distance_weight=args.distance_weight,
+        max_track_distance=args.max_track_distance,
     )
