@@ -22,6 +22,8 @@ import os
 import json
 import time
 import atexit
+import signal
+import threading
 import argparse
 import logging
 from typing import List, Tuple, Optional, Dict, Any
@@ -410,6 +412,19 @@ def main(
 
     # ========== Phase 3: Main detection loop ==========
 
+    # Graceful shutdown flag — set by SIGTERM/SIGHUP handler so the main loop
+    # can exit cleanly and run cleanup.  Without this, Python's default
+    # behaviour terminates immediately without running atexit handlers.
+    _shutdown_event = threading.Event()
+
+    def _sigterm_handler(signum, _frame):
+        sig_name = signal.Signals(signum).name
+        _logger.info(f"Received {sig_name}, requesting graceful shutdown...")
+        _shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGHUP, _sigterm_handler)
+
     def cleanup():
         _logger.info("Cleaning up...")
         cmd_socket.close()
@@ -438,6 +453,24 @@ def main(
 
     while True:
         try:
+            # --- Check shutdown conditions ------------------------------------
+            # 1) SIGTERM / SIGHUP via signal handler
+            if _shutdown_event.is_set():
+                _logger.info("Shutdown flag set (signal), stopping main loop...")
+                break
+
+            # 2) ZMQ shutdown command from master node
+            try:
+                cmd_msg = cmd_socket.recv_string(zmq.NOBLOCK)
+                cmd_data = json.loads(cmd_msg)
+                if cmd_data.get("cmd") == "shutdown":
+                    _logger.info("Received shutdown command from master, stopping...")
+                    break
+                else:
+                    _logger.debug(f"Ignoring cmd during main loop: {cmd_data}")
+            except zmq.Again:
+                pass
+
             # Receive synchronized images (non-blocking)
             try:
                 msg = sync_socket.recv(zmq.NOBLOCK)
