@@ -42,7 +42,7 @@ from server_tool import log_util
 # Parse ZMQ endpoints
 from server_tool import zmq_channel_util
 
-_logger = logging.getLogger(__name__)
+_logger = logging.getLogger("wilor")
 
 
 def calculate_area(bbox):
